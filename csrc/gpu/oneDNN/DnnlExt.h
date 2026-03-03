@@ -91,6 +91,11 @@ enum class joint_dtypes_t {
   bf16_f8_e5m2,
   f16_f8_e4m3,
   bf16_f8_e4m3,
+  // int8 x int8 combinations for w8a8 matmul
+  _s8_s8,
+  _s8_u8,
+  _u8_s8,
+  _u8_u8,
 };
 
 enum class trans_type_t { nn = 0, nt, tn, tt };
@@ -202,6 +207,43 @@ struct onednn_types_mapper<joint_dtypes_t::bf16_f8_e4m3> {
   get() {
     return std::make_tuple(
         dnnl::memory::data_type::bf16, dnnl::memory::data_type::f8_e4m3);
+  }
+};
+
+// int8 x int8 mappers for w8a8 matmul
+template <>
+struct onednn_types_mapper<joint_dtypes_t::_s8_s8> {
+  static inline std::tuple<dnnl::memory::data_type, dnnl::memory::data_type>
+  get() {
+    return std::make_tuple(
+        dnnl::memory::data_type::s8, dnnl::memory::data_type::s8);
+  }
+};
+
+template <>
+struct onednn_types_mapper<joint_dtypes_t::_s8_u8> {
+  static inline std::tuple<dnnl::memory::data_type, dnnl::memory::data_type>
+  get() {
+    return std::make_tuple(
+        dnnl::memory::data_type::s8, dnnl::memory::data_type::u8);
+  }
+};
+
+template <>
+struct onednn_types_mapper<joint_dtypes_t::_u8_s8> {
+  static inline std::tuple<dnnl::memory::data_type, dnnl::memory::data_type>
+  get() {
+    return std::make_tuple(
+        dnnl::memory::data_type::u8, dnnl::memory::data_type::s8);
+  }
+};
+
+template <>
+struct onednn_types_mapper<joint_dtypes_t::_u8_u8> {
+  static inline std::tuple<dnnl::memory::data_type, dnnl::memory::data_type>
+  get() {
+    return std::make_tuple(
+        dnnl::memory::data_type::u8, dnnl::memory::data_type::u8);
   }
 };
 
@@ -598,10 +640,13 @@ struct matmul_primitive_cache_t {
       auto src_md = memory::desc({m, k}, src_dt, src_strides);
       auto wei_md = memory::desc({k, n}, wei_dt, wei_strides);
       // TODO: should decide dst dt in a better way?
+      // For int8 x int4 (w4a8) and int8 x int8 (w8a8), output is f16
       auto dst_dt =
           (((src_dt == dnnl::memory::data_type::s8 ||
              src_dt == dnnl::memory::data_type::u8) &&
-            (wei_dt == dnnl::memory::data_type::u4))
+            (wei_dt == dnnl::memory::data_type::u4 ||
+             wei_dt == dnnl::memory::data_type::s8 ||
+             wei_dt == dnnl::memory::data_type::u8))
                ? dnnl::memory::data_type::f16
                : src_dt);
       auto dst_md = memory::desc({m, n}, dst_dt, dst_strides);
@@ -822,8 +867,24 @@ static inline primitive_ext& matmul_primitive_create_and_cache(
           attr,
           scale_group_size,
           zp_group_size);
+    case joint_dtypes_t::_s8_s8:
+      return matmul_primitive_create_and_cache<joint_dtypes_t::_s8_s8, F>(
+          Tt, b_type, m, n, k, lda, ldb, ldc, device_id, attr,
+          scale_group_size, zp_group_size);
+    case joint_dtypes_t::_s8_u8:
+      return matmul_primitive_create_and_cache<joint_dtypes_t::_s8_u8, F>(
+          Tt, b_type, m, n, k, lda, ldb, ldc, device_id, attr,
+          scale_group_size, zp_group_size);
+    case joint_dtypes_t::_u8_s8:
+      return matmul_primitive_create_and_cache<joint_dtypes_t::_u8_s8, F>(
+          Tt, b_type, m, n, k, lda, ldb, ldc, device_id, attr,
+          scale_group_size, zp_group_size);
+    case joint_dtypes_t::_u8_u8:
+      return matmul_primitive_create_and_cache<joint_dtypes_t::_u8_u8, F>(
+          Tt, b_type, m, n, k, lda, ldb, ldc, device_id, attr,
+          scale_group_size, zp_group_size);
     default:
-      throw std::runtime_error("Only support int4 and fp8 gemm ...");
+      throw std::runtime_error("Only support int4, fp8 and int8 gemm ...");
   }
 }
 

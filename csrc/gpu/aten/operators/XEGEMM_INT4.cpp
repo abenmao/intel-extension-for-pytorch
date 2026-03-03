@@ -1321,6 +1321,35 @@ static Tensor mm_bias_silu_mul_w4a8(
   return out;
 }
 
+// W8A8 GEMM: int8 activation × int8 weight → fp16 output
+// Signature matches torch.ops.torch_ipex.mm_w8a8 used in ByteMLPerf quant_matmul
+static Tensor mm_w8a8(
+    const Tensor& input,
+    const Tensor& input_scl,
+    const c10::optional<Tensor>& input_zp,
+    const Tensor& weight,
+    const Tensor& weight_scl,
+    const Tensor& weight_zp,
+    Tensor& result) {
+  // TORCH_CHECK(!input_scl.has_value(), "scale for activation is not supported.");
+  TORCH_CHECK(!input_zp.has_value(), "zp for activation is not supported.");
+#ifndef USE_PRIMITIVE_CACHE
+  TORCH_CHECK(false, "mm_w8a8 is only available when USE_PRIMITIVE_CACHE=ON");
+#else // USE_PRIMITIVE_CACHE
+  torch_ipex::xpu::oneDNN::dnnl_matmul_w8a8(
+      result,
+      input,
+      input_scl,
+      input_zp,
+      weight,
+      std::nullopt,
+      weight_scl,
+      weight_zp,
+      false);
+#endif // USE_PRIMITIVE_CACHE
+  return result;
+}
+
 } // namespace AtenIpexTypeXPU
 } // namespace at
 
@@ -1378,6 +1407,7 @@ IPEX_LIBRARY_FRAGMENT() {
       "mm_silu_mul_w4a8.xpu", at::AtenIpexTypeXPU::mm_silu_mul_w4a8);
   IPEX_OP_REGISTER(
       "mm_bias_silu_mul_w4a8.xpu", at::AtenIpexTypeXPU::mm_bias_silu_mul_w4a8);
+  IPEX_OP_REGISTER("mm_w8a8.xpu", at::AtenIpexTypeXPU::mm_w8a8);
 }
 } // namespace
 #else
