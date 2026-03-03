@@ -908,6 +908,297 @@ static inline void dnnl_matmul_w8a16_fp8(
       matmul_ext, strm, engine, arg_handles, arg_off);
 }
 
+// ========== W8A8 matmul support ==========
+// Helper: set primitive attrs for w8a8 (both activation and weight are int8)
+static inline void set_w8a8_quant_primitive_attr(
+    primitive_attr& pattr,
+    const Tensor& scale,
+    const c10::optional<Tensor>& zp,
+    const int64_t act_quant_mode,
+    const int64_t k) {
+#ifdef USE_SCRATCHPAD_MODE
+  pattr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+#endif
+  // conditional src scale/zp (per-token or per-tensor, if mode is specified)
+  if (act_quant_mode == static_cast<int64_t>(ActQuantScheme::QUANT_A_PER_M) ||
+      act_quant_mode ==
+          static_cast<int64_t>(ActQuantScheme::QUANT_A_PER_M_SYM)) {
+    pattr.set_scales(
+        DNNL_ARG_SRC,
+        /* mask */ (1 << 0) + (1 << 1),
+        {1, k},
+        get_onednn_dtype(scale));
+    pattr.set_zero_points(
+        DNNL_ARG_SRC,
+        /* mask */ (1 << 0) + (1 << 1),
+        {1, k},
+        memory::data_type::s32);
+  } else if (
+      act_quant_mode ==
+          static_cast<int64_t>(ActQuantScheme::QUANT_A_PER_TENSOR) ||
+      act_quant_mode ==
+          static_cast<int64_t>(ActQuantScheme::QUANT_A_PER_TENSOR_SYM)) {
+    pattr.set_scales(
+        DNNL_ARG_SRC,
+        /* mask */ 0,
+        {},
+        get_onednn_dtype(scale));
+    pattr.set_zero_points(
+        DNNL_ARG_SRC,
+        /* mask */ 0,
+        {},
+        memory::data_type::s32);
+  }
+  // Always set per-row src scales (overrides the conditional above for -1 mode)
+  pattr.set_scales(
+      DNNL_ARG_SRC,
+      /* mask */ (1 << 0) + (1 << 1),
+      {1, k},
+      get_onednn_dtype(scale));
+  // per-column weight scales
+  pattr.set_scales(
+      DNNL_ARG_WEIGHTS,
+      /* mask */ (1 << 0) + (1 << 1),
+      {k, 1},
+      get_onednn_dtype(scale));
+  // per-tensor weight zero point
+  pattr.set_zero_points(
+      DNNL_ARG_WEIGHTS,
+      /* mask */ 0,
+      {},
+      memory::data_type::s8);
+}
+
+// Helper: set weight scale + zp attributes for w8a8
+static int set_w8a8_wei_scale_zp_attr(
+    primitive_ext& matmul_ext,
+    engine& eng,
+    const Tensor& /*mat1*/,
+    const Tensor& /*mat2*/,
+    const Tensor& scale,
+    const Tensor& zp,
+    int arg_off = 0) {
+  matmul_ext.set_attribute(
+      arg_off++,
+      DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
+      scale.data_ptr(),
+      [&]() {
+        return dpcpp_onednn_memory(
+            get_onednn_md(scale), eng, scale.data_ptr());
+      });
+  matmul_ext.set_attribute(
+      arg_off++,
+      DNNL_ARG_ATTR_ZERO_POINTS | DNNL_ARG_WEIGHTS,
+      zp.data_ptr(),
+      [&]() {
+        return dpcpp_onednn_memory(get_onednn_md(zp), eng, zp.data_ptr());
+      });
+  return arg_off;
+}
+
+// Helper: determine bias_type_t using IPEX make_bias_type API
+static inline bias_type_t determine_bias_type_w8a8(
+    const c10::optional<Tensor>& bias,
+    int m,
+    int n) {
+  if (!bias.has_value() || !bias.value().defined() ||
+      bias.value().numel() == 0) {
+    return make_bias_type(bias_shape_t::none, bias_data_type_t::none);
+  }
+  auto& b = bias.value();
+  const auto nuelm = b.numel();
+  bias_shape_t shape;
+  if (nuelm == 1) {
+    shape = bias_shape_t::scalar;
+  } else if (nuelm == (int64_t)m * n) {
+    shape = bias_shape_t::mn;
+  } else if (b.size(b.dim() - 1) == n && nuelm == n) {
+    shape = bias_shape_t::n;
+  } else if (b.size(b.dim() - 1) == 1 && nuelm == m) {
+    shape = bias_shape_t::m;
+  } else {
+    TORCH_CHECK(0, "unsupported bias dim in w8a8 matmul: ", b.sizes());
+    return make_bias_type(bias_shape_t::none, bias_data_type_t::none);
+  }
+  bias_data_type_t dtype;
+  switch (b.scalar_type()) {
+    case at::ScalarType::Float:
+      dtype = bias_data_type_t::f32;
+      break;
+    case at::ScalarType::BFloat16:
+      dtype = bias_data_type_t::bf16;
+      break;
+    case at::ScalarType::Half:
+      dtype = bias_data_type_t::f16;
+      break;
+    default:
+      TORCH_CHECK(
+          false,
+          "Unsupported bias dtype for w8a8 matmul: ",
+          b.scalar_type());
+      return make_bias_type(bias_shape_t::none, bias_data_type_t::none);
+  }
+  return make_bias_type(shape, dtype);
+}
+
+// Core w8a8 matmul primitive (both activation and weight are int8)
+template <typename F>
+static at::Tensor dnnl_matmul_w8a8_common(
+    Tensor& result, // dst, [b, m, n]
+    const Tensor& mat1, // src, [b, m, k], int8
+    const Tensor& act_scale, // activation scale [m] per-token or scalar
+    const c10::optional<Tensor>& act_zp, // activation zero point (unused)
+    const Tensor& mat2, // quantized weight, [k, n], int8
+    const c10::optional<Tensor>& bias,
+    const Tensor& weight_scale, // [n] per-channel weight scale
+    const Tensor& weight_zp, // [1] or [n] weight zero point
+    bool m2_trans,
+    F pattr,
+    Tensor res_flat,
+    Tensor res1_flat) {
+  TORCH_CHECK(mat1.is_contiguous(), "Expect mat1 to be contiguous");
+  TORCH_CHECK(
+      mat1.scalar_type() == at::ScalarType::Char ||
+          mat1.scalar_type() == at::ScalarType::Byte,
+      "Expect mat1 (activation) to be int8 or uint8, but got ",
+      mat1.scalar_type());
+  TORCH_CHECK(
+      mat2.scalar_type() == at::ScalarType::Char ||
+          mat2.scalar_type() == at::ScalarType::Byte,
+      "Expect mat2 (weight) to be int8 or uint8, but got ",
+      mat2.scalar_type());
+
+  auto src_sz = mat1.sizes();
+  auto b_sz = mat2.sizes();
+
+  const int m = std::reduce(
+      src_sz.begin(), src_sz.end() - 1, 1, std::multiplies<int64_t>());
+  const int n = b_sz[b_sz.size() - 1]; // last dim of (possibly transposed) weight
+  const int k = *(src_sz.end() - 1);
+
+  // get device, engine, stream
+  const int device_id = at::xpu::current_device();
+  at::Device curDevice = at::Device(at::kXPU, device_id);
+  auto engine = GpuEngineManager::Instance().get_engine(curDevice);
+
+  // Select joint dtype based on signed/unsigned combination
+  dnnl::joint_dtypes_t jd;
+  if (mat1.scalar_type() == at::ScalarType::Char) {
+    jd = (mat2.scalar_type() == at::ScalarType::Char)
+        ? dnnl::joint_dtypes_t::_s8_s8
+        : dnnl::joint_dtypes_t::_s8_u8;
+  } else {
+    jd = (mat2.scalar_type() == at::ScalarType::Char)
+        ? dnnl::joint_dtypes_t::_u8_s8
+        : dnnl::joint_dtypes_t::_u8_u8;
+  }
+
+  bias_type_t b_type = determine_bias_type_w8a8(bias, m, n);
+
+  const int64_t ldb = mat2.strides()[mat2.dim() - 1];
+  const int64_t lda = mat1.strides()[mat1.dim() - 2];
+  const int64_t ldc = result.strides()[result.dim() - 2];
+
+  trans_type_t tt = trans_type_t::nt;
+  int64_t group_size = -1;
+  int64_t zp_group_size = -1;
+  auto& matmul_ext = matmul_primitive_create_and_cache(
+      jd, tt, b_type, m, n, k, lda, ldb, ldc, device_id, pattr,
+      group_size, zp_group_size);
+
+  int arg_off = 0;
+
+  matmul_ext.set_attribute(
+      arg_off++,
+      DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC,
+      act_scale.data_ptr(),
+      [&]() {
+        return dpcpp_onednn_memory(
+            get_onednn_md(act_scale), engine, act_scale.data_ptr());
+      });
+
+  arg_off = set_w8a8_wei_scale_zp_attr(
+      matmul_ext, engine, mat1, mat2, weight_scale, weight_zp, arg_off);
+
+  if (res_flat.defined()) {
+    matmul_ext.set_attribute(
+        arg_off++,
+        DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1,
+        res_flat.data_ptr(),
+        [&]() {
+          return dpcpp_onednn_memory(
+              get_onednn_md(res_flat), engine, res_flat.data_ptr());
+        });
+  }
+  if (res1_flat.defined()) {
+    matmul_ext.set_attribute(
+        arg_off++,
+        DNNL_ARG_ATTR_MULTIPLE_POST_OP(1) | DNNL_ARG_SRC_1,
+        res1_flat.data_ptr(),
+        [&]() {
+          return dpcpp_onednn_memory(
+              get_onednn_md(res1_flat), engine, res1_flat.data_ptr());
+        });
+  }
+
+  std::vector<std::pair<int, void*>> arg_handles;
+  arg_handles.reserve(8);
+  arg_handles.emplace_back(DNNL_ARG_SRC, mat1.data_ptr());
+  arg_handles.emplace_back(DNNL_ARG_WEIGHTS, mat2.data_ptr());
+  arg_handles.emplace_back(DNNL_ARG_DST, result.data_ptr());
+  if (bias.has_value() && bias.value().defined()) {
+    arg_handles.emplace_back(DNNL_ARG_BIAS, bias.value().data_ptr());
+  }
+
+#ifdef USE_SCRATCHPAD_MODE
+  int scratchpad_size = matmul_ext.get_scratchpad_size();
+  Tensor scratchpad_tensor = at::AtenIpexTypeXPU::empty(
+      {scratchpad_size}, mat1.options().dtype(at::kByte), c10::nullopt);
+  arg_handles.emplace_back(DNNL_ARG_SCRATCHPAD, scratchpad_tensor.data_ptr());
+#endif
+
+  auto strm = GpuStreamManager::Instance().get_stream();
+  DPCPP_ONEDNN_EXEC_WITH_ARGHANDLES(
+      matmul_ext, strm, engine, arg_handles, arg_off);
+
+  return result;
+}
+
+// Public API: w8a8 matmul (int8 activation × int8 weight → fp16 output)
+static at::Tensor dnnl_matmul_w8a8(
+    Tensor& result, // dst, [b, m, n], fp16
+    const Tensor& mat1, // src, [b, m, k], int8
+    const Tensor& act_scale, // [m] per-token activation scale
+    const c10::optional<Tensor>& act_zp, // unused (symmetric)
+    const Tensor& mat2, // weight, [k, n], int8
+    const c10::optional<Tensor>& bias,
+    const Tensor& weight_scale, // [n] per-channel weight scale
+    const Tensor& weight_zp, // [1] weight zero point (int8)
+    bool m2_trans) {
+  RECORD_FUNCTION("dnnl_matmul_w8a8", std::vector<c10::IValue>({mat1, mat2}));
+
+  const int64_t k = mat1.size(-1);
+  auto quant = [&](primitive_attr& pattr) {
+    set_w8a8_quant_primitive_attr(
+        pattr, weight_scale, act_zp, /*act_quant_mode=*/-1, k);
+  };
+
+  return dnnl_matmul_w8a8_common(
+      result,
+      mat1,
+      act_scale,
+      act_zp,
+      mat2,
+      bias,
+      weight_scale,
+      weight_zp,
+      m2_trans,
+      quant,
+      at::Tensor(),
+      at::Tensor());
+}
+// ========== End W8A8 matmul support ==========
+
 } // namespace oneDNN
 } // namespace torch_ipex::xpu
 
