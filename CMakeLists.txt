@@ -45,7 +45,7 @@ if(NOT EXISTS ${TORCH_INSTALL_PREFIX})
 endif()
 
 if(NOT ${Torch_COMP_VERION} VERSION_EQUAL "${Torch_VERSION_MAJOR}.${Torch_VERSION_MINOR}")
-  message(FATAL_ERROR "Not compatible Torch version ${Torch_VERSION} at ${TORCH_INSTALL_PREFIX}!\nTorch ${Torch_COMP_VERION} is needed!")
+  message(WARNING "Not matching Torch version ${Torch_VERSION} at ${TORCH_INSTALL_PREFIX}! Torch ${Torch_COMP_VERION} was expected. Proceeding anyway (ABI may differ).")
 endif()
 
 include(${IPEX_ROOT_DIR}/cmake/Options.cmake)

@@ -55,6 +55,8 @@ function(GEN_XPU file_yaml)
     COMMAND "${PYTHON_EXECUTABLE}" ${PROJECT_SOURCE_DIR}/scripts/tools/torchgen/remove_headers.py --register_xpu_path ${RegisterXPU_PATH}
     COMMAND "${PYTHON_EXECUTABLE}" ${PROJECT_SOURCE_DIR}/scripts/tools/torchgen/remove_headers.py --register_xpu_path ${RegisterSparseXPU_PATH}
     COMMAND "${PYTHON_EXECUTABLE}" ${PROJECT_SOURCE_DIR}/scripts/tools/torchgen/remove_headers.py --register_xpu_path ${RegisterNestedTensorXPU_PATH}
+    # Fix default argument redefinition conflicts with torch >= 2.11 native XPU headers
+    COMMAND "${PYTHON_EXECUTABLE}" ${PROJECT_SOURCE_DIR}/scripts/tools/torchgen/fix_native_default_args.py --gen_dir ${BUILD_IPEX_GPU_ATEN_GENERATED}
     WORKING_DIRECTORY ${IPEX_ROOT_DIR}
     DEPENDS
     ${depended_files}

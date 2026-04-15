@@ -102,14 +102,13 @@ void InitIPEX::check_pytorch_version() {
   }
   if (IPEX_VERSION_MAJOR != TORCH_VERSION_MAJOR ||
       IPEX_VERSION_MINOR != TORCH_VERSION_MINOR) {
-    printf(
-        "ERROR! Intel® Extension for PyTorch* needs to work with PyTorch/libtorch %d.%d.*, but PyTorch/libtorch %d.%d.%d is found. Please switch to the matching version and run again.\n",
+    fprintf(stderr,
+        "WARNING: Intel® Extension for PyTorch* %d.%d.* is running with PyTorch/libtorch %d.%d.%d. ABI incompatibility may occur.\n",
         IPEX_VERSION_MAJOR,
         IPEX_VERSION_MINOR,
         TORCH_VERSION_MAJOR,
         TORCH_VERSION_MINOR,
         TORCH_VERSION_PATCH);
-    exit(127);
   }
 }
 

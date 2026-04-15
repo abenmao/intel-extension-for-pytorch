@@ -27,13 +27,21 @@ if matches and len(matches.groups()) == 1:
 matches = re.match(r"(\d+\.\d+).*", __version__)
 if matches and len(matches.groups()) == 1:
     ipex_version = matches.group(1)
-if torch_version == "" or ipex_version == "" or torch_version != ipex_version:
+if torch_version == "" or ipex_version == "":
     print(
         "ERROR! Intel® Extension for PyTorch* needs to work with PyTorch "
         + f"{ipex_version}.*, but PyTorch {torch.__version__} is found. "
         + "Please switch to the matching version and run again."
     )
     os._exit(127)
+if torch_version != ipex_version:
+    import warnings
+    warnings.warn(
+        f"Intel® Extension for PyTorch* {__version__} was built for PyTorch "
+        f"{ipex_version}.*, but PyTorch {torch.__version__} is found. "
+        f"This may cause unexpected issues due to ABI incompatibility.",
+        stacklevel=2,
+    )
 
 
 import os
